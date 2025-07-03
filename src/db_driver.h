@@ -255,7 +255,6 @@ typedef struct db_conn
 } db_conn_t;
 
 /* Prepared statement definition */
-
 typedef struct db_stmt
 {
   db_conn_t       *connection;     /* Connection which this statement belongs to */
@@ -339,6 +338,10 @@ int register_driver_mysql(sb_list_t *);
 
 #ifdef USE_PGSQL
 int register_driver_pgsql(sb_list_t *);
+#endif
+
+#ifdef USE_CMP
+int register_driver_cmp(sb_list_t *);
 #endif
 
 #endif /* DB_DRIVER_H */

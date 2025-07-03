@@ -26,6 +26,10 @@ if USE_MYSQL
 mysql_ldadd = drivers/mysql/libsbmysql.a $(MYSQL_LIBS)
 endif
 
+if USE_CMP
+mysql_ldadd = drivers/compare/libscmp.a $(MYSQL_LIBS)
+endif
+
 if USE_PGSQL
 pgsql_ldadd = drivers/pgsql/libsbpgsql.a $(PGSQL_LIBS)
 endif

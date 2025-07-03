@@ -55,7 +55,6 @@ typedef bool my_bool;
 #endif
 
 /* MySQL driver arguments */
-
 static sb_arg_t mysql_drv_args[] =
 {
   SB_OPT("mysql-host", "MySQL server host", "localhost", LIST),
@@ -234,7 +233,6 @@ static int mysql_drv_thread_done(int);
 static int mysql_drv_done(void);
 
 /* MySQL driver definition */
-
 static db_driver_t mysql_driver =
 {
   .sname = "mysql",
@@ -363,7 +361,6 @@ int mysql_drv_init(void)
 }
 
 /* Thread-local driver initialization */
-
 int mysql_drv_thread_init(int thread_id)
 {
   (void) thread_id; /* unused */
@@ -571,8 +568,6 @@ int mysql_drv_disconnect(db_conn_t *sb_conn)
 
 
 /* Prepare statement */
-
-
 int mysql_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
 {
   MYSQL_STMT *mystmt;
@@ -725,9 +720,9 @@ int mysql_drv_bind_param(db_stmt_t *stmt, db_bind_t *params, size_t len)
 }
 
 
+
+
 /* Bind results for prepared statement */
-
-
 int mysql_drv_bind_result(db_stmt_t *stmt, db_bind_t *params, size_t len)
 {
   MYSQL_BIND   *bind;
@@ -1041,8 +1036,6 @@ db_error_t mysql_drv_stmt_next_result(db_stmt_t *stmt, db_result_t *rs)
 
 
 /* Execute SQL query */
-
-
 db_error_t mysql_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
                            db_result_t *rs)
 {

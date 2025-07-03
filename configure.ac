@@ -143,6 +143,17 @@ AS_IF([test "x$with_pgsql" != "xno"],
    [pgsql_support=no])
 AC_MSG_RESULT([$pgsql_support])
 
+# Check if we should compile with CMP support
+AC_ARG_WITH([cmp],
+            AS_HELP_STRING([--with-cmp],
+                           [compile with Compare support (default is enabled)]),
+            [], [with_cmp=yes])
+AC_MSG_CHECKING([whether to compile with CMP support])
+AS_IF([test "x$with_cmp" != "xno"],
+   [cmp_support=yes],
+   [cmp_support=no])
+AC_MSG_RESULT([$cmp_support])
+
 # Set LuaJIT flags
 SB_LUAJIT
 
@@ -203,6 +214,8 @@ AC_SUBST([USE_PGSQL])
 # Check for libaio
 AC_CHECK_AIO
 AM_CONDITIONAL(USE_AIO, test x$enable_aio = xyes)
+
+AM_CONDITIONAL([USE_CMP], [test "x$cmp_support" = "xyes"])
 
 AC_CHECK_HEADERS([ \
 errno.h \
@@ -400,6 +413,7 @@ src/Makefile
 src/drivers/Makefile
 src/drivers/mysql/Makefile
 src/drivers/pgsql/Makefile
+src/drivers/compare/Makefile
 src/tests/Makefile
 src/tests/cpu/Makefile
 src/tests/fileio/Makefile
@@ -430,6 +444,7 @@ AC_MSG_RESULT([datadir            : $(eval echo ${datadir})])
 AC_MSG_RESULT([])
 AC_MSG_RESULT([MySQL support      : ${mysql_support}])
 AC_MSG_RESULT([PostgreSQL support : ${pgsql_support}])
+AC_MSG_RESULT([CMP support        : ${cmp_support}])
 AC_MSG_RESULT([])
 AC_MSG_RESULT([LuaJIT             : ${sb_use_luajit}])
 AC_MSG_RESULT([LUAJIT_CFLAGS      : ${LUAJIT_CFLAGS}])
