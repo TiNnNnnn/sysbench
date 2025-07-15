@@ -86,7 +86,6 @@ prime
 stage
 *.snap
 /snap/snapcraft.yaml
-*.sh
 prepare.sh
 qgen.sh
 run.sh
