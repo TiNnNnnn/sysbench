@@ -144,6 +144,10 @@ typedef int drv_op_close(struct db_stmt *);
 typedef int drv_op_thread_done(int);
 typedef int drv_op_done(void);
 
+/*only for drv_compare*/
+typedef int drv_op_dql_cmp(void);
+typedef int drv_op_dml_cmp(void);
+
 typedef struct
 {
   drv_op_init            *init;           /* initializate driver */
@@ -168,6 +172,9 @@ typedef struct
   drv_op_query           *query;          /* execute non-prepared statement */
   drv_op_thread_done     *thread_done;    /* thread-local driver deinitialization */
   drv_op_done            *done;           /* uninitialize driver */
+
+  drv_op_dql_cmp      *dql_cmp;    /* compare DQL results */
+  drv_op_dml_cmp      *dml_cmp;    /* compare DML results */
 } drv_ops_t;
 
 /* Database driver definition */
@@ -178,7 +185,7 @@ typedef struct
   const char      *lname;   /* long name */
   sb_arg_t        *args;    /* driver command line arguments */
   drv_ops_t       ops;      /* driver operations */
-
+  
   sb_list_item_t  listitem; /* can be linked in a list */
   bool            initialized;
   pthread_mutex_t mutex;

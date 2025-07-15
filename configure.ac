@@ -200,6 +200,7 @@ ACX_PTHREAD
 AC_CHECK_LIB(m, sqrt)
 
 SB_CHECK_MYSQL
+SB_CHECK_CMP
 
 AS_IF([test x$with_pgsql != xno], [
     AC_CHECK_PGSQL([$with_pgsql])
@@ -215,7 +216,7 @@ AC_SUBST([USE_PGSQL])
 AC_CHECK_AIO
 AM_CONDITIONAL(USE_AIO, test x$enable_aio = xyes)
 
-AM_CONDITIONAL([USE_CMP], [test "x$cmp_support" = "xyes"])
+
 
 AC_CHECK_HEADERS([ \
 errno.h \

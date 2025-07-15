@@ -158,14 +158,12 @@ int sb_thread_cancel(pthread_t thread)
 int sb_thread_create_workers(void *(*worker_routine)(void*))
 {
   unsigned int i;
-
   log_text(LOG_NOTICE, "Initializing worker threads...\n");
 
   for(i = 0; i < sb_globals.threads; i++)
   {
     threads[i].id = i;
   }
-
 
   for(i = 0; i < sb_globals.threads; i++)
   {

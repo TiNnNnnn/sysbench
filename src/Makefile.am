@@ -27,7 +27,7 @@ mysql_ldadd = drivers/mysql/libsbmysql.a $(MYSQL_LIBS)
 endif
 
 if USE_CMP
-mysql_ldadd = drivers/compare/libscmp.a $(MYSQL_LIBS)
+cmp_ldadd = drivers/compare/libscmp.a $(MYSQL_LIBS)
 endif
 
 if USE_PGSQL
@@ -48,7 +48,7 @@ xoroshiro128plus.h
 sysbench_LDADD = tests/fileio/libsbfileio.a tests/threads/libsbthreads.a \
     tests/memory/libsbmemory.a tests/cpu/libsbcpu.a \
     tests/mutex/libsbmutex.a \
-    $(mysql_ldadd) $(pgsql_ldadd) \
+    $(mysql_ldadd) $(pgsql_ldadd) $(cmp_ldadd)\
     $(LUAJIT_LIBS) $(CK_LIBS)
 
 sysbench_LDFLAGS = $(mysql_ldflags) \

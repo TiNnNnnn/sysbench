@@ -1,12 +1,12 @@
 dnl ---------------------------------------------------------------------------
-dnl Macro: SB_CHECK_MYSQL
+dnl Macro: SB_CHECK_CMP
 dnl First check if the MySQL root directory is specified with --with-mysql.
 dnl Otherwise check for custom MySQL paths in --with-mysql-includes and
 dnl --with-mysql-libs. If some paths are not specified explicitly, try to get
 dnl them from mysql_config.
 dnl ---------------------------------------------------------------------------
 
-AC_DEFUN([SB_CHECK_MYSQL],[
+AC_DEFUN([SB_CHECK_CMP],[
 
 AS_IF([test "x$with_mysql" != xno], [
 
@@ -108,10 +108,10 @@ ERROR: cannot find MySQL libraries. If you want to compile with MySQL support,
     fi
 fi
 
-AC_DEFINE([USE_MYSQL], 1,
+AC_DEFINE([USE_CMP], 1,
           [Define to 1 if you want to compile with MySQL support])
 
-USE_MYSQL=1
+USE_CMP=1
 AC_SUBST([MYSQL_LIBS])
 AC_SUBST([MYSQL_CFLAGS])
 
@@ -133,6 +133,6 @@ enum mysql_option opt = MYSQL_OPT_SSL_MODE;
 CFLAGS="${SAVE_CFLAGS}"
 
 
-AM_CONDITIONAL([USE_MYSQL], test "x$with_mysql" != xno)
-AC_SUBST([USE_MYSQL])
+AM_CONDITIONAL([USE_CMP], test "x$with_cmp" != xno)
+AC_SUBST([USE_CMP])
 ])

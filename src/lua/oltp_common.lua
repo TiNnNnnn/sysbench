@@ -78,7 +78,13 @@ sysbench.cmdline.options = {
           "PostgreSQL driver. The only currently supported " ..
           "variant is 'redshift'. When enabled, " ..
           "create_secondary is automatically disabled, and " ..
-          "delete_inserts is set to 0"}
+          "delete_inserts is set to 0"},
+   batch_count = 
+      {"Number of batch", 2},
+   query_count_per_batch = 
+      {"Number of query count per batch", 10},
+   update_count_per_batch = 
+     {"Number of update count per batch", 10},
 }
 
 -- Prepare the dataset. This command supports parallel execution, i.e. will
@@ -146,6 +152,8 @@ local c_value_template = "###########-###########-###########-" ..
 local pad_value_template = "###########-###########-###########-" ..
    "###########-###########"
 
+local workload = {}
+
 function get_c_value()
    return sysbench.rand.string(c_value_template)
 end
@@ -166,7 +174,7 @@ function create_table(drv, con, table_num)
      id_index_def = "PRIMARY KEY"
    end
 
-   if drv:name() == "mysql"
+   if drv:name() == "mysql" or drv:name() == "cmp"
    then
       if sysbench.opt.auto_inc then
          id_def = "INTEGER NOT NULL AUTO_INCREMENT"
@@ -276,7 +284,92 @@ local stmt_defs = {
    inserts = {
       "INSERT INTO sbtest%u (id, k, c, pad) VALUES (?, ?, ?, ?)",
       t.INT, t.INT, {t.CHAR, 120}, {t.CHAR, 60}},
+   selects = {
+      {"SELECT t1.c, t2.k FROM sbtest1 as t1 JOIN sbtest%u as t2 ON t1.id = t2.id WHERE t1.id BETWEEN ? AND ? LIMIT 10",
+      t.INT, t.INT},
+      {"SELECT t1.c, t2.k FROM sbtest3 as t1 LEFT JOIN sbtest%u as t2 ON t1.c > t2.c WHERE t1.pad BETWEEN ? AND ? LIMIT 10",
+         {t.CHAR, 60}, {t.CHAR, 60}},
+      {"SELECT k, COUNT(*) as count FROM sbtest%u WHERE k >= ? GROUP BY k ORDER BY count DESC LIMIT 10 ",
+         t.INT},
+      {"SELECT c FROM sbtest%u WHERE k > ? ORDER BY k DESC LIMIT 10",
+         t.INT},
+      {"SELECT k, c, COUNT(*) as count FROM sbtest%u WHERE k >= ? GROUP BY k, c ORDER BY count DESC LIMIT 10",
+         t.INT},
+      {"SELECT c FROM sbtest%u WHERE k IN (SELECT k FROM sbtest4 WHERE id BETWEEN ? AND ?) ORDER BY k DESC LIMIT 10",
+         t.INT, t.INT
+      },
+      {"SELECT k, COUNT(*) as count FROM sbtest%u WHERE k >= ? GROUP BY k ORDER BY count DESC LIMIT 10 OFFSET ?",
+      t.INT, t.INT
+      },
+      {"SELECT k, COUNT(*) as count FROM sbtest%u WHERE k >= (SELECT MAX(k) from sbtest5 where c < ? GROUP BY c) GROUP BY k ORDER BY count DESC LIMIT 10",
+      {t.CHAR, 120}, t.INT
+      },
+      {"SELECT t1.c, t2.k FROM sbtest1 as t1 JOIN sbtest%u as t2 ON t1.id = t2.id WHERE t1.id NOT IN (SELECT t3.k FROM sbtest2 as t3 where t1.c = t3.c) AND t1.id BETWEEN ? AND ? LIMIT 10",
+      t.INT, t.INT},
+   }
 }
+
+function workload_generate()
+   local workload_file = "workload.txt"
+   local batch_separator = "--BATCH_SEPARATOR--"
+
+   -- open files
+   local file = io.open(workload_file, "w")
+   assert(file, "Failed to open workload file for writing")
+
+   print("Generating workload,Batch count: " .. sysbench.opt.batch_count .. 
+      ", Query count per batch: " .. sysbench.opt.query_count_per_batch .. 
+      ", Update count per batch: " .. sysbench.opt.update_count_per_batch .. "")
+   for batch = 1, sysbench.opt.batch_count do
+      -- generate query batches
+      local query_batches = {}
+      for i = 1, sysbench.opt.query_count_per_batch do
+         local tnum = sysbench.rand.uniform(1, sysbench.opt.tables)
+         local template = stmt_defs.selects[sysbench.rand.uniform(1, #stmt_defs.selects)]
+         
+         -- Parameter generation based on template type
+         local query = string.format(template[1], tnum)
+         if #template == 2 then  -- 1-parameter query
+             local param = sysbench.rand.default(1, sysbench.opt.table_size)
+             query = query:gsub("%?", param)
+         elseif #template == 3 then  -- 2-parameter query
+             local p1 = sysbench.rand.default(1, sysbench.opt.table_size)
+             local p2 = math.min(p1 + sysbench.rand.default(1, 100), sysbench.opt.table_size)
+             query = query:gsub("%?", p1, 1)  -- Replace first ?
+             query = query:gsub("%?", p2)     -- Replace second ?
+         end
+         table.insert(query_batches, query)
+     end
+
+      -- write query batches to file
+      file:write("--QUERY_BATCH_START--\n")
+      for _, query in ipairs(query_batches) do
+         file:write(query .. "\n")
+      end
+      file:write(batch_separator .. "\n")
+
+      -- generate update batches
+      local update_batches = {}
+      for i = 1, sysbench.opt.update_count_per_batch do
+         local tnum = sysbench.rand.uniform(1, sysbench.opt.tables)
+         local template = stmt_defs.index_updates
+         local id = sysbench.rand.uniform(1, sysbench.opt.table_size)
+         local update = string.format(template[1], tnum)
+         update = string.gsub(update, "?", id)
+         table.insert(update_batches, update)
+      end
+
+      -- write update batches to file
+      file:write("--UPDATE_BATCH_START--\n")
+      for _, update in ipairs(update_batches) do
+         file:write(update .. "\n")
+      end
+      file:write(batch_separator .. "\n")
+   end
+
+   file:close()
+   print("Workload generated and written to " .. workload_file)
+end
 
 function prepare_begin()
    stmt.begin = con:prepare("BEGIN")
@@ -316,6 +409,10 @@ function prepare_for_each_table(key)
          stmt[t][key]:bind_param(unpack(param[t][key]))
       end
    end
+end
+
+function prepare_selects()
+   prepare_for_each_table("selects")
 end
 
 function prepare_point_selects()
@@ -416,6 +513,49 @@ function commit()
    stmt.commit:execute()
 end
 
+function execute_selects()
+   local tnum = sysbench.rand.uniform(1, sysbench.opt.tables)
+   local template = stmt_defs.selects[sysbench.rand.uniform(1, #stmt_defs.selects)]
+
+   -- Generate query with parameters
+   local query = string.format(template[1], tnum)
+   
+   if #template == 2 then  -- 1-parameter query
+      if template[2] == t.INT then
+         query = query:gsub("%?", get_id())
+      elseif type(template[2]) == "table" and template[2][1] == t.CHAR then
+         if template[2][2] == 120 then  -- c column
+            query = query:gsub("%?", get_c_value())
+         elseif template[2][2] == 60 then  -- pad column
+            query = query:gsub("%?", get_pad_value())
+         end
+      end
+   elseif #template == 3 then  -- 2-parameter query
+      local id = get_id()
+      if template[2] == t.INT then
+         query = query:gsub("%?", id, 1)
+      elseif type(template[2]) == "table" and template[2][1] == t.CHAR then
+         if template[2][2] == 120 then  -- c column
+            query = query:gsub("%?", get_c_value(), 1)
+         elseif template[2][2] == 60 then  -- pad column
+            query = query:gsub("%?", get_pad_value(), 1)
+         end
+      end
+      
+      if template[3] == t.INT then
+         query = query:gsub("%?", id + sysbench.opt.range_size - 1)
+      elseif type(template[3]) == "table" and template[3][1] == t.CHAR then
+         if template[3][2] == 120 then  -- c column
+            query = query:gsub("%?", get_c_value())
+         elseif template[3][2] == 60 then  -- pad column
+            query = query:gsub("%?", get_pad_value())
+         end
+      end
+   end
+
+   con:query(query)
+end
+
 function execute_point_selects()
    local tnum = get_table_num()
    local i
@@ -468,7 +608,6 @@ end
 
 function execute_non_index_updates()
    local tnum = get_table_num()
-
    for i = 1, sysbench.opt.non_index_updates do
       param[tnum].non_index_updates[1]:set_rand_str(c_value_template)
       param[tnum].non_index_updates[2]:set(get_id())
@@ -519,3 +658,194 @@ function check_reconnect()
       end
    end
 end
+
+
+-- function create_table_tpch(drv, con, table_num)
+--    local id_index_def, id_def
+--    local engine_def = ""
+--    local extra_table_options = ""
+--    local query
+
+   -- if sysbench.opt.secondary then
+   --   id_index_def = "KEY xid"
+   -- else
+   --   id_index_def = "PRIMARY KEY"
+   -- end
+
+   -- if drv:name() == "mysql" or drv:name() == "cmp"
+   -- then
+   --    if sysbench.opt.auto_inc then
+   --       id_def = "INTEGER NOT NULL AUTO_INCREMENT"
+   --    else
+   --       id_def = "INTEGER NOT NULL"
+   --    end
+   --    engine_def = "/*! ENGINE = " .. sysbench.opt.mysql_storage_engine .. " */"
+   -- elseif drv:name() == "pgsql"
+   -- then
+   --    if not sysbench.opt.auto_inc then
+   --       id_def = "INTEGER NOT NULL"
+   --    elseif pgsql_variant == 'redshift' then
+   --      id_def = "INTEGER IDENTITY(1,1)"
+   --    else
+   --      id_def = "SERIAL"
+   --    end
+   -- else
+   --    error("Unsupported database driver:" .. drv:name())
+   -- end
+
+--    print(string.format("Creating table 'sbtest%d'...", table_num))
+
+--    query = string.format([[
+--       CREATE TABLE PART%d (
+--       P_PARTKEY		SERIAL,
+--       P_NAME			VARCHAR(55),
+--       P_MFGR			CHAR(25),
+--       P_BRAND			CHAR(10),
+--       P_TYPE			VARCHAR(25),
+--       P_SIZE			INTEGER,
+--       P_CONTAINER		CHAR(10),
+--       P_RETAILPRICE	DECIMAL,
+--       P_COMMENT		VARCHAR(23)
+--    )]],table_num)
+--    con:query(query)
+
+--    query = string.format([[
+--       CREATE TABLE SUPPLIER%d (
+--          S_SUPPKEY		SERIAL,
+--          S_NAME			CHAR(25),
+--          S_ADDRESS		VARCHAR(40),
+--          S_NATIONKEY		INTEGER NOT NULL, 
+--          S_PHONE			CHAR(15),
+--          S_ACCTBAL		DECIMAL,
+--          S_COMMENT		VARCHAR(101)
+--    )]],table_num)
+--    con:query(query)
+
+--    query = string.format([[
+--       CREATE TABLE PARTSUPP%d (
+--          PS_PARTKEY		INTEGER NOT NULL, 
+--          PS_SUPPKEY		INTEGER NOT NULL,
+--          PS_AVAILQTY		INTEGER,
+--          PS_SUPPLYCOST	DECIMAL,
+--          PS_COMMENT		VARCHAR(199)
+--    )]],table_num)
+--    con:query(query)
+
+--    query = string.format([[
+--       CREATE TABLE CUSTOMER (
+--          C_CUSTKEY		SERIAL,
+--          C_NAME			VARCHAR(25),
+--          C_ADDRESS		VARCHAR(40),
+--          C_NATIONKEY		INTEGER NOT NULL, -- references N_NATIONKEY
+--          C_PHONE			CHAR(15),
+--          C_ACCTBAL		DECIMAL,
+--          C_MKTSEGMENT	CHAR(10),
+--          C_COMMENT		VARCHAR(117)
+--    )]],table_num)
+--    con:query(query)
+
+--    query = string.format([[
+--       CREATE TABLE ORDERS (
+--          O_ORDERKEY		SERIAL,
+--          O_CUSTKEY		INTEGER NOT NULL, 
+--          O_ORDERSTATUS	CHAR(1),
+--          O_TOTALPRICE	DECIMAL,
+--          O_ORDERDATE		DATE,
+--          O_ORDERPRIORITY	CHAR(15),
+--          O_CLERK			CHAR(15),
+--          O_SHIPPRIORITY	INTEGER,
+--          O_COMMENT		VARCHAR(79)
+--    )]],table_num)
+--    con:query(query)
+
+--    query = string.format([[
+--       CREATE TABLE LINEITEM (
+--          L_ORDERKEY		INTEGER NOT NULL, 
+--          L_PARTKEY		INTEGER NOT NULL, 
+--          L_SUPPKEY		INTEGER NOT NULL, 
+--          L_LINENUMBER	INTEGER,
+--          L_QUANTITY		DECIMAL,
+--          L_EXTENDEDPRICE	DECIMAL,
+--          L_DISCOUNT		DECIMAL,
+--          L_TAX			DECIMAL,
+--          L_RETURNFLAG	CHAR(1),
+--          L_LINESTATUS	CHAR(1),
+--          L_SHIPDATE		DATE,
+--          L_COMMITDATE	DATE,
+--          L_RECEIPTDATE	DATE,
+--          L_SHIPINSTRUCT	CHAR(25),
+--          L_SHIPMODE		CHAR(10),
+--          L_COMMENT		VARCHAR(44)
+--    )]],table_num)
+--    con:query(query)
+
+--    query = string.format([[
+--       CREATE TABLE NATION (
+--          N_NATIONKEY		SERIAL,
+--          N_NAME			CHAR(25),
+--          N_REGIONKEY		INTEGER NOT NULL,  -- references R_REGIONKEY
+--          N_COMMENT		VARCHAR(152)
+--    )]],table_num)
+--    con:query(query)
+
+--    query = string.format([[
+--       CREATE TABLE REGION (
+--          R_REGIONKEY	SERIAL,
+--          R_NAME		CHAR(25),
+--          R_COMMENT	VARCHAR(152)
+--    )]],table_num)
+--    con:query(query)
+
+--    if (sysbench.opt.table_size > 0) then
+--       print(string.format("Inserting %d records into 'sbtest%d'",
+--                           sysbench.opt.table_size, table_num))
+--    end
+
+--    con:query("ALTER TABLE PART"..table_num.." ADD PRIMARY KEY (P_PARTKEY)")
+--    con:query("ALTER TABLE SUPPLIER"..table_num.." ADD PRIMARY KEY (S_SUPPKEY)")
+--    con:query("ALTER TABLE PARTSUPP"..table_num.." ADD PRIMARY KEY (PS_PARTKEY, PS_SUPPKEY)")
+--    con:query("ALTER TABLE CUSTOMER"..table_num.." ADD PRIMARY KEY (C_CUSTKEY)")
+--    con:query("ALTER TABLE ORDERS"..table_num.." ADD PRIMARY KEY (O_ORDERKEY)")
+--    con:query("ALTER TABLE LINEITEM"..table_num.." ADD PRIMARY KEY (L_ORDERKEY, L_LINENUMBER)")
+--    con:query("ALTER TABLE NATION"..table_num.." ADD PRIMARY KEY (N_NATIONKEY)")
+--    con:query("ALTER TABLE REGION"..table_num.." ADD PRIMARY KEY (R_REGIONKEY)")
+
+--    if sysbench.opt.auto_inc then
+--       query = "INSERT INTO sbtest" .. table_num .. "(k, c, pad) VALUES"
+--    else
+--       query = "INSERT INTO sbtest" .. table_num .. "(id, k, c, pad) VALUES"
+--    end
+
+--    con:bulk_insert_init(query)
+
+--    local c_val
+--    local pad_val
+
+--    for i = 1, sysbench.opt.table_size do
+
+--       c_val = get_c_value()
+--       pad_val = get_pad_value()
+
+--       if (sysbench.opt.auto_inc) then
+--          query = string.format("(%d, '%s', '%s')",
+--                                sysbench.rand.default(1, sysbench.opt.table_size),
+--                                c_val, pad_val)
+--       else
+--          query = string.format("(%d, %d, '%s', '%s')",
+--                                i,
+--                                sysbench.rand.default(1, sysbench.opt.table_size),
+--                                c_val, pad_val)
+--       end
+
+--       con:bulk_insert_next(query)
+--    end
+
+--    con:bulk_insert_done()
+
+--    if sysbench.opt.create_secondary then
+--       print(string.format("Creating a secondary index on 'sbtest%d'...",
+--                           table_num))
+--       con:query(string.format("CREATE INDEX k_%d ON sbtest%d(k)",
+--                               table_num, table_num))
+--    end
+-- end

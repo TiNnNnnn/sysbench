@@ -101,7 +101,7 @@ sb_arg_t general_args[] =
          "number of seconds to wait after the --time limit before forcing "
          "shutdown, or 'off' to disable", "off", STRING),
   SB_OPT("thread-stack-size", "size of stack per thread", "64K", SIZE),
-  SB_OPT("thread-init-timeout", "wait time in seconds for worker threads to initialize", "30", INT),
+  SB_OPT("thread-init-timeout", "wait time in seconds for worker threads to initialize", "3000", INT),
   SB_OPT("rate", "average transactions rate. 0 for unlimited rate", "0", INT),
   SB_OPT("report-interval", "periodically report intermediate statistics with "
          "a specified interval in seconds. 0 disables intermediate reports",
@@ -1140,7 +1140,7 @@ static int run_test(sb_test_t *test)
       return 1;
     }
   }
-
+  
   if ((err = sb_thread_create_workers(&worker_thread)))
     return err;
 
@@ -1575,6 +1575,15 @@ int main(int argc, char *argv[])
   else if (!strcmp(sb_globals.cmdname, "run"))
   {
     rc = run_test(test) ? EXIT_FAILURE : EXIT_SUCCESS;
+  }else if(!strcmp(sb_globals.cmdname, "qgen")){
+    if (test->builtin_cmds.qgen == NULL)
+    {
+      fprintf(stderr, "'%s' test does not implement the 'qgen' command.\n",
+              test->sname);
+      rc = EXIT_FAILURE;
+      goto end;
+    }
+    rc = test->builtin_cmds.qgen(); 
   }
   else
   {

@@ -11,8 +11,9 @@
 #ifdef HAVE_STRINGS_H
 # include <strings.h>
 #endif
-#include <stdio.h>
 
+#include <stdio.h>
+#include <stdatomic.h>
 #include <mysql.h>
 #include <mysqld_error.h>
 #include <errmsg.h>
@@ -20,7 +21,7 @@
 #include "sb_options.h"
 #include "db_driver.h"
 
-
+#define OUTPUT_BUFFER_SIZE 4096
 #define DEBUG(format, ...)                      \
   do {                                          \
     if (SB_UNLIKELY(args.debug != 0))           \
@@ -43,8 +44,8 @@ static sb_arg_t mysql_drv_args[] =
   SB_OPT("mysql-host", "MySQL server host", "localhost", LIST),
   SB_OPT("mysql-port", "MySQL server port", "3306", LIST),
   SB_OPT("mysql-socket", "MySQL socket", NULL, LIST),
-  SB_OPT("mysql-user", "MySQL user", "sbtest", STRING),
-  SB_OPT("mysql-password", "MySQL password", "", STRING),
+  SB_OPT("mysql-user", "MySQL user", "sbtest", LIST),
+  SB_OPT("mysql-password", "MySQL password", "", LIST),
   SB_OPT("mysql-db", "MySQL database name", "sbtest", STRING),
 #ifdef HAVE_MYSQL_OPT_SSL_MODE
   SB_OPT("mysql-ssl", "SSL mode. This accepts the same values as the "
@@ -79,8 +80,8 @@ typedef struct
   sb_list_t          *hosts;
   sb_list_t          *ports;
   sb_list_t          *sockets;
-  const char         *user;
-  const char         *password;
+  sb_list_t         *users;
+  sb_list_t         *passwords;
   const char         *db;
 #ifdef HAVE_MYSQL_OPT_SSL_MODE
   unsigned int       ssl_mode;
@@ -111,11 +112,21 @@ typedef struct
   char         *socket; /*sockets*/
 } db_mysql_conn_t;
 
+typedef struct {
+  char *query;            /*The query string*/
+  db_result_t *results;   /*Array of results for each connection*/
+  int result_count;       /*Number of results*/
+} query_result_map_t;
+
 /*list of conns*/
 typedef struct
 {
     db_mysql_conn_t *connections; /*mysql_conn_t list*/
     int              conn_count; /*conn num*/
+
+    query_result_map_t *result_maps; // Array of result maps
+    int map_count;           // Number of result maps
+    int map_capacity;        // Capacity of result maps array
 } db_mysql_multi_conn_t;
 
 typedef struct
@@ -126,7 +137,8 @@ typedef struct
 
 typedef struct
 {
-    db_result_t *results; /* Array of db_result_t for each connection */
+    MYSQL_RES * mysql_results; /*Array of MYSQL_RES for each connection (used in drv_query) */
+    db_result_t *results; /* Array of db_result_t for each connection (used in drv_execuate)*/
     int          result_count; /* Number of results (same as connection count) */
 } db_mysql_multi_result_t;
 
@@ -139,7 +151,6 @@ typedef struct {
 
 
 /* Structure used for DB-to-MySQL bind types map */
-
 typedef struct
 {
   db_bind_type_t   db_type;
@@ -147,7 +158,7 @@ typedef struct
 } db_mysql_bind_map_t;
 
 /* DB-to-MySQL bind types map */
-db_mysql_bind_map_t db_mysql_bind_map[] =
+static db_mysql_bind_map_t db_mysql_bind_map[] =
 {
   {DB_TYPE_TINYINT,   MYSQL_TYPE_TINY},
   {DB_TYPE_SMALLINT,  MYSQL_TYPE_SHORT},
@@ -175,15 +186,14 @@ static drv_caps_t mysql_drv_caps =
 };
 
 static mysql_drv_args_t args;          /* driver args */
-
 static char use_ps; /* whether server-side prepared statemens should be used */
 
-/* Positions in the list of hosts/ports/sockets. Protected by pos_mutex */
-static sb_list_item_t *hosts_pos;
-static sb_list_item_t *ports_pos;
-static sb_list_item_t *sockets_pos;
-
 static pthread_mutex_t pos_mutex;
+static pthread_mutex_t checksum_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_barrier_t checksum_barrier;
+
+static atomic_ullong dml_counter = ATOMIC_VAR_INIT(0);
+static long long unsigned checksum_interval = 10000;
 
 #ifdef HAVE_MYSQL_OPT_SSL_MODE
 
@@ -232,6 +242,8 @@ static int mysql_drv_free_results(db_result_t *);
 static int mysql_drv_close(db_stmt_t *);
 static int mysql_drv_thread_done(int);
 static int mysql_drv_done(void);
+static int mysql_drv_dql_cmp(void);
+static int mysql_drv_dml_cmp(db_stmt_t *stmt);
 
 
 static mysql_multi_stmt_t *mysql_multi_stmt_create(int stmt_count);
@@ -239,9 +251,9 @@ static void mysql_multi_stmt_free(mysql_multi_stmt_t *multi_stmt);
 static db_mysql_multi_result_t *db_mysql_multi_result_create(int result_count);
 static void db_mysql_multi_result_free(db_mysql_multi_result_t *multi_result);
 static int sb_list_size(sb_list_t *list);
-
+static char* replace_placeholders(const char* q_str, MYSQL_BIND* q_params, int param_count);
 /* MySQL driver definition */
-static db_driver_t mysql_driver =
+static db_driver_t cmp_driver =
 {
   .sname = "cmp",
   .lname = "Compare driver",
@@ -266,8 +278,10 @@ static db_driver_t mysql_driver =
     .close = mysql_drv_close,
     .query = mysql_drv_query,
     .thread_done = mysql_drv_thread_done,
-    .done = mysql_drv_done
-  }
+    .done = mysql_drv_done,
+    //.dql_cmp = mysql_drv_dql_cmp,
+    //.dml_cmp = mysql_drv_dml_cmp
+  },
 };
 
 /* Local functions */
@@ -276,8 +290,70 @@ static int get_mysql_bind_type(db_bind_type_t);
 /* Register MySQL driver */
 int register_driver_cmp(sb_list_t *drivers)
 {
-  SB_LIST_ADD_TAIL(&mysql_driver.listitem, drivers);
+  SB_LIST_ADD_TAIL(&cmp_driver.listitem, drivers);
+  return 0;
+}
 
+/*no used*/
+int mysql_drv_dql_cmp(void){}
+
+/*use checksum to compare dml result*/
+int mysql_drv_dml_cmp(db_stmt_t *stmt)
+{
+  int tb_num = sb_get_value_int("tables");
+  char query[256];
+  db_result_t rs;
+
+  for(int i = 1; i <= tb_num; ++i){
+    snprintf(query, sizeof(query),
+    "SELECT BIT_XOR(CAST(CRC32(CONCAT_WS(',',id,k,c,pad)) AS UNSIGNED)) "
+    "FROM sbtest%d LOCK IN SHARE MODE", i);
+
+    db_error_t err = mysql_drv_query(stmt->connection, query, strlen(query), &rs);
+    if (err != DB_ERROR_NONE) {
+      log_text(LOG_FATAL, "Failed to execute checksum for table sbtest%d", i);
+      continue;
+    }
+    db_mysql_multi_result_t* multi_results = (db_mysql_multi_result_t*)rs.ptr;
+    
+    MYSQL_RES *first_res = &multi_results->mysql_results[0];
+    if (!first_res) {
+      fprintf(stderr, "ERROR: No result set for query in conn %d: %s\n", 0 ,query);
+      continue;
+    }
+    
+    MYSQL_ROW row;
+    /*Store checksum from first connection*/
+    unsigned long first_checksum = 0;
+    while((row = mysql_fetch_row(first_res))) {
+      if (row[0] != NULL) {
+         first_checksum = strtoul(row[0], NULL, 10);
+      }
+    }
+
+    /*Compare with checksums from other connections*/
+    for(int j = 1; j < multi_results->result_count; ++j){
+      MYSQL_RES *res = &multi_results->mysql_results[j];
+      if (!res) {
+        fprintf(stderr, "ERROR: No result set for query in conn %d: %s\n", j, query);
+        continue;
+      }
+      
+      MYSQL_ROW other_row;
+      unsigned long other_checksum = 0;
+      while((other_row = mysql_fetch_row(res))) {
+        if (other_row[0] != NULL) {
+          other_checksum = strtoul(other_row[0], NULL, 10);
+       }
+      }
+
+      if (first_checksum != other_checksum) {
+        log_text(LOG_FATAL, "Checksum mismatch for table sbtest%d: conn0=%lu, conn%d=%lu", 
+                i, first_checksum, j, other_checksum);
+        return -1;
+      }
+    }
+  }
   return 0;
 }
 
@@ -286,30 +362,48 @@ int mysql_drv_init(void)
 {
   /**drv_init has support multi instance params*/
   pthread_mutex_init(&pos_mutex, NULL);
-
+  pthread_barrier_init(&checksum_barrier, NULL, sb_globals.threads);
+  /*parse mysql-host*/
   args.hosts = sb_get_value_list("mysql-host");
   if (SB_LIST_IS_EMPTY(args.hosts))
   {
     log_text(LOG_FATAL, "No MySQL hosts specified, aborting");
     return 1;
   }
-  hosts_pos = SB_LIST_ITEM_NEXT(args.hosts);
-
+  int host_count = sb_list_size(args.hosts);
+  /*parse mysql-port*/
   args.ports = sb_get_value_list("mysql-port");
   if (SB_LIST_IS_EMPTY(args.ports))
   {
     log_text(LOG_FATAL, "No MySQL ports specified, aborting");
     return 1;
   }
-  ports_pos = SB_LIST_ITEM_NEXT(args.ports);
-
+  /*parse mysql-socket*/
   args.sockets = sb_get_value_list("mysql-socket");
-  sockets_pos = args.sockets;
-
-  args.user = sb_get_value_string("mysql-user");
-  args.password = sb_get_value_string("mysql-password");
+  /*parse mysql-user */
+  args.users = sb_get_value_list("mysql-user");
+  int user_count = sb_list_size(args.users);
+  if (!user_count)
+  {
+    log_text(LOG_FATAL, "No MySQL users specified, aborting");
+    return 1;
+  }else if(host_count != user_count){
+    log_text(LOG_FATAL, "mysql-host and mysql-user count not equal, aborting");
+    return 1;
+  }
+  /*parse mysql-password*/
+  args.passwords = sb_get_value_list("mysql-password");
+  int passwd_count = sb_list_size(args.passwords);
+  if (!passwd_count)
+  {
+    log_text(LOG_FATAL, "No MySQL passwords specified, aborting");
+    return 1;
+  }else if(host_count != passwd_count){
+    log_text(LOG_FATAL, "mysql-host and mysql-password count not equal, aborting");
+    return 1;
+  }
+  /*parse single params*/
   args.db = sb_get_value_string("mysql-db");
-
   args.ssl_cipher = sb_get_value_string("mysql-ssl-cipher");
   args.ssl_key = sb_get_value_string("mysql-ssl-key");
   args.ssl_cert = sb_get_value_string("mysql-ssl-cert");
@@ -356,7 +450,7 @@ int mysql_drv_init(void)
   if (db_globals.ps_mode != DB_PS_MODE_DISABLE)
     use_ps = 1;
 
-  DEBUG("mysql_library_init(%d, %p, %p)", 0, NULL, NULL);
+  DEBUG("mysql_library_init(%d, %p, %p)\n", 0, NULL, NULL);
   mysql_library_init(0, NULL, NULL);
 
   return 0;
@@ -450,13 +544,15 @@ static int mysql_drv_real_connect(db_mysql_conn_t *db_mysql_con)
 
 int sb_list_size(sb_list_t *list)
 {
+    if(SB_LIST_IS_EMPTY(list))
+        return 0;
     int count = 0;
     sb_list_item_t *item = list;
-    while (item)
-    {
+    item = SB_LIST_ITEM_NEXT(item);
+    do{
         count++;
         item = SB_LIST_ITEM_NEXT(item);
-    }
+    }while (item != list);
     return count;
 }
 
@@ -464,7 +560,7 @@ int sb_list_size(sb_list_t *list)
 int mysql_drv_connect(db_conn_t *sb_conn)
 {
     db_mysql_multi_conn_t *multi_conn;
-    sb_list_item_t *current_host, *current_port, *current_socket;
+    sb_list_item_t *current_host, *current_port, *current_socket, *current_user,*current_password;
     int conn_index = 0;
 
     if (args.dry_run)
@@ -475,6 +571,8 @@ int mysql_drv_connect(db_conn_t *sb_conn)
         return 1;
 
     int host_count = sb_list_size(args.hosts);
+    log_text(LOG_NOTICE, "[Instance Count]: %d\n", host_count);
+
     multi_conn->connections = (db_mysql_conn_t *)calloc(host_count, sizeof(db_mysql_conn_t));
     if (multi_conn->connections == NULL)
     {
@@ -485,18 +583,21 @@ int mysql_drv_connect(db_conn_t *sb_conn)
 
     pthread_mutex_lock(&pos_mutex);
 
-    current_host = args.hosts;
-    current_port = args.ports;
-    current_socket = args.sockets;
+    current_host =  SB_LIST_ITEM_NEXT(args.hosts);
+    current_port =  SB_LIST_ITEM_NEXT(args.ports);
+    if(args.sockets)
+      current_socket =  SB_LIST_ITEM_NEXT(args.sockets);
+    current_user = SB_LIST_ITEM_NEXT(args.users);
+    current_password = SB_LIST_ITEM_NEXT(args.passwords);
 
-    while (current_host != NULL)
+    do
     {
         db_mysql_conn_t *conn = &multi_conn->connections[conn_index];
         conn->host = SB_LIST_ENTRY(current_host, value_t, listitem)->data;
         conn->port = atoi(SB_LIST_ENTRY(current_port, value_t, listitem)->data);
         conn->socket = current_socket ? SB_LIST_ENTRY(current_socket, value_t, listitem)->data : NULL;
-        conn->user = args.user;
-        conn->password = args.password;
+        conn->user = SB_LIST_ENTRY(current_user, value_t, listitem)->data;
+        conn->password = SB_LIST_ENTRY(current_password, value_t, listitem)->data;
         conn->db = args.db;
 
         conn->mysql = mysql_init(NULL);
@@ -509,6 +610,8 @@ int mysql_drv_connect(db_conn_t *sb_conn)
             return 1;
         }
 
+        log_text(LOG_DEBUG, "Trying connect to mysql host '%s', port %u, user %s, passwd %s, db %s", 
+            conn->host, conn->port,conn->user,conn->password,conn->db);
         if (mysql_drv_real_connect(conn))
         {
             log_text(LOG_FATAL, "Failed to connect to MySQL host '%s', port %u", conn->host, conn->port);
@@ -527,9 +630,10 @@ int mysql_drv_connect(db_conn_t *sb_conn)
         current_port = SB_LIST_ITEM_NEXT(current_port);
         if (current_socket)
             current_socket = SB_LIST_ITEM_NEXT(current_socket);
-
+        current_user = SB_LIST_ITEM_NEXT(current_user);
+        current_password = SB_LIST_ITEM_NEXT(current_password);
         conn_index++;
-    }
+    }while(current_host != args.hosts);
 
     pthread_mutex_unlock(&pos_mutex);
 
@@ -633,7 +737,6 @@ int mysql_drv_prepare(db_stmt_t *stmt, const char *query, size_t len)
 
     stmt->ptr = (void *)multi_stmt;
     stmt->query = strdup(query);
-
     return 0;
 }
 
@@ -671,16 +774,8 @@ int mysql_drv_bind_param(db_stmt_t *stmt, db_bind_t *params, size_t len)
 
     if (stmt->emulated)
     {
-        /* Use emulation */
-        if (stmt->bound_param != NULL)
-            free(stmt->bound_param);
-        stmt->bound_param = (db_bind_t *)malloc(len * sizeof(db_bind_t));
-        if (stmt->bound_param == NULL)
-            return 1;
-        memcpy(stmt->bound_param, params, len * sizeof(db_bind_t));
-        stmt->bound_param_len = len;
-
-        return 0;
+       log_text(LOG_FATAL, "not support emulated in binding params");
+       return 1;
     }
 
     mysql_multi_stmt_t *mystmts = (mysql_multi_stmt_t *)stmt->ptr;
@@ -887,86 +982,88 @@ static db_error_t check_error(db_conn_t *sb_conn, const char *func,
     *counter = SB_CNT_ERROR;
     return DB_ERROR_FATAL;
   }
-
   return DB_ERROR_NONE;
 }
 
 db_error_t mysql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 {
-    db_conn_t *con = stmt->connection;
+    MYSQL_BIND *q_params;
+    int param_count;
 
+    mysql_multi_stmt_t *mystmts = (mysql_multi_stmt_t *)stmt->ptr;
     if (args.dry_run)
         return DB_ERROR_NONE;
 
-    con->sql_errno = 0;
-    con->sql_state = NULL;
-    con->sql_errmsg = NULL;
-
     if (stmt->emulated)
     {
-        /* Use emulation */
-        char *buf = NULL;
-        unsigned int buflen = 0;
-        unsigned int i, j, vcnt;
-        char need_realloc;
-        int n;
-
-        /* Build the actual query string from parameters list */
-        need_realloc = 1;
-        vcnt = 0;
-        for (i = 0, j = 0; stmt->query[i] != '\0'; i++)
-        {
-        again:
-            if (j + 1 >= buflen || need_realloc)
-            {
-                buflen = (buflen > 0) ? buflen * 2 : 256;
-                buf = realloc(buf, buflen);
-                if (buf == NULL)
-                {
-                    log_text(LOG_DEBUG, "ERROR: exiting mysql_drv_execute(), memory allocation failure");
-                    return DB_ERROR_FATAL;
-                }
-                need_realloc = 0;
-            }
-
-            if (stmt->query[i] != '?')
-            {
-                buf[j++] = stmt->query[i];
-                continue;
-            }
-
-            n = db_print_value(stmt->bound_param + vcnt, buf + j, (int)(buflen - j));
-            if (n < 0)
-            {
-                need_realloc = 1;
-                goto again;
-            }
-            j += (unsigned int)n;
-            vcnt++;
-        }
-        buf[j] = '\0';
-
-        db_error_t rc = mysql_drv_query(con, buf, j, rs);
-
-        free(buf);
-
-        return rc;
+       log_text(LOG_FATAL, "not support emulated execute");
+       return DB_ERROR_FATAL;
     }
 
-    mysql_multi_stmt_t *mystmts = (mysql_multi_stmt_t *)stmt->ptr;
-
+    bool dml = stmt->query &&
+    (!strncasecmp(stmt->query, "insert", 6) || !strncasecmp(stmt->query, "update", 6) ||
+     !strncasecmp(stmt->query, "delete", 6) || !strncasecmp(stmt->query, "replace", 7));
+    
     /* Create multi-result structure */
     db_mysql_multi_result_t *multi_result = db_mysql_multi_result_create(mystmts->stmt_count);
     if (!multi_result)
         return DB_ERROR_FATAL;
-
+    char rs_buf[mystmts->stmt_count][OUTPUT_BUFFER_SIZE];
     for (int conn_index = 0; conn_index < mystmts->stmt_count; conn_index++)
     {
         MYSQL_STMT *mystmt = mystmts->statements[conn_index];
+        int num_fields,row_count;
+      
         if (!mystmt)
             continue;
-
         db_result_t *current_result = &multi_result->results[conn_index];
+
+        param_count= mysql_stmt_param_count(mystmt);
+        q_params = mystmt->params;
+
+        my_bool is_null[10];
+        unsigned long length[10];
+        MYSQL_BIND bind[10];
+        MYSQL_FIELD *fields;
+
+        if(!dml){
+          MYSQL_RES* prepare_meta_result = mysql_stmt_result_metadata(mystmt);
+          if (!prepare_meta_result && !dml) {
+            fprintf(stderr, "mysql_stmt_result_metadata() failed\n");
+            return -1;
+          }
+          num_fields = mysql_num_fields(prepare_meta_result);
+          fields = mysql_fetch_fields(prepare_meta_result);
+  
+          memset(bind, 0, sizeof(MYSQL_BIND) * num_fields);
+  
+          for(int i = 0; i < num_fields; ++i){
+            bind[i].buffer_type = fields[i].type;
+            bind[i].is_null = &is_null[i];
+            bind[i].length = &length[i];
+  
+            switch(fields[i].type) {
+              case MYSQL_TYPE_LONG:
+                  bind[i].buffer = malloc(sizeof(int));
+                  bind[i].buffer_length = sizeof(int);
+                  break;
+              case MYSQL_TYPE_STRING:
+                  bind[i].buffer = malloc(fields[i].length + 1);
+                  bind[i].buffer_length = fields[i].length;
+                  break;
+              default:
+                  fprintf(stderr, "Unsupported field type: %d\n", fields[i].type);
+                  break;
+            }
+          }
+          
+          if (mysql_stmt_bind_result(mystmt, bind))
+          {
+            fprintf(stderr, " mysql_stmt_bind_result() failed\n");
+            fprintf(stderr, " %s\n", mysql_stmt_error(mystmt));
+            exit(0);
+          }
+        }
 
         /* Execute the prepared statement */
         int err = mysql_stmt_execute(mystmt);
@@ -974,7 +1071,7 @@ db_error_t mysql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 
         if (err)
         {
-            db_error_t rc = check_error(con, "mysql_stmt_execute()", stmt->query, &current_result->counter);
+            db_error_t rc = check_error(stmt->connection, "mysql_stmt_execute()", stmt->query, &current_result->counter);
             if (rc != DB_ERROR_NONE)
             {
                 db_mysql_multi_result_free(multi_result);
@@ -988,7 +1085,7 @@ db_error_t mysql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 
         if (err)
         {
-            db_error_t rc = check_error(con, "mysql_stmt_store_result()", NULL, &current_result->counter);
+            db_error_t rc = check_error(stmt->connection, "mysql_stmt_store_result()", NULL, &current_result->counter);
             if (rc != DB_ERROR_NONE)
             {
                 db_mysql_multi_result_free(multi_result);
@@ -998,121 +1095,76 @@ db_error_t mysql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
 
         current_result->nrows = (uint32_t)mysql_stmt_num_rows(mystmt);
         current_result->nfields = (uint32_t)mysql_stmt_field_count(mystmt);
-        current_result->ptr = mystmt;
-
         DEBUG("mysql_stmt_num_rows(%p) = %u for connection %d", mystmt, (unsigned)current_result->nrows, conn_index);
         DEBUG("mysql_stmt_field_count(%p) = %u for connection %d", mystmt, (unsigned)current_result->nfields, conn_index);
 
         /* Store the first connection's result in rs */
-        if (conn_index == 0)
+        if (conn_index == 0 && rs)
         {
             rs->nrows = current_result->nrows;
             rs->nfields = current_result->nfields;
             rs->counter = current_result->counter;
         }
+        
+        if(!dml){
+          int buffer_pos = 0;
+          row_count = 0;
+          while (!mysql_stmt_fetch(mystmt))
+          {
+              row_count++;
+              buffer_pos += snprintf(rs_buf[conn_index] + buffer_pos, OUTPUT_BUFFER_SIZE - buffer_pos,
+                                    "rows %d:\n", row_count);
+              for(int i = 0; i < num_fields; ++i){
+                if (is_null[i]) {
+                  buffer_pos += snprintf(rs_buf[conn_index] + buffer_pos, OUTPUT_BUFFER_SIZE - buffer_pos,
+                                        "  %s: NULL ", fields[i].name);
+                } else {
+                  buffer_pos += snprintf(rs_buf[conn_index] + buffer_pos, OUTPUT_BUFFER_SIZE - buffer_pos,
+                                          "  %s: %.*s (length: %lu) ", 
+                                          fields[i].name,(int)length[i], (char*)bind[i].buffer , length[i]);
+                }
+              }
+              buffer_pos += snprintf(rs_buf[conn_index] + buffer_pos, OUTPUT_BUFFER_SIZE - buffer_pos,"\n");
+          }
+        }
     }
-
+    
+    if (dml) {
+      // if (atomic_fetch_add(&dml_counter, 1) + 1 >= checksum_interval) {
+      //   pthread_barrier_wait(&checksum_barrier);
+      //   pthread_mutex_lock(&checksum_mutex);
+      //   if (atomic_load(&dml_counter) >= checksum_interval) {
+      //     atomic_store(&dml_counter, 0);
+      //     mysql_drv_dml_cmp(stmt);
+      //   }
+      //   pthread_mutex_unlock(&checksum_mutex);
+      //   pthread_barrier_wait(&checksum_barrier);
+      // }
+    }else if(stmt->query && !strncasecmp(stmt->query, "SELECT", 6)){
+      char* first_res = rs_buf[0];
+      for(int j = 1; j < mystmts->stmt_count; ++j){
+        if(strcmp(first_res, rs_buf[j])){
+          char* final_query = replace_placeholders(stmt->query, q_params, param_count);
+          fprintf(stdout, "result0: %s\n", first_res);
+          fprintf(stdout, "result%d: %s\n",j, rs_buf[j]);
+          fprintf(stdout, "query: %s\n", final_query);
+          //log_text(LOG_FATAL, "result not match");
+        }
+      }
+    }
     db_mysql_multi_result_free(multi_result);
-
     return DB_ERROR_NONE;
 }
 
-db_error_t mysql_drv_stmt_next_result(db_stmt_t *stmt, db_result_t *rs)
-{
-    db_conn_t *con = stmt->connection;
-
-    if (args.dry_run)
-        return DB_ERROR_NONE;
-
-    con->sql_errno = 0;
-    con->sql_state = NULL;
-    con->sql_errmsg = NULL;
-
-    if (stmt->emulated)
-        return mysql_drv_next_result(con, rs);
-
-    if (!stmt->ptr)
-    {
-        log_text(LOG_DEBUG,
-                 "ERROR: exiting mysql_drv_stmt_next_result(), "
-                 "uninitialized statement");
-        return DB_ERROR_FATAL;
-    }
-
-    mysql_multi_stmt_t *mystmts = (mysql_multi_stmt_t *)stmt->ptr;
-
-    for (int conn_index = 0; conn_index < mystmts->stmt_count; conn_index++)
-    {
-        MYSQL_STMT *mystmt = mystmts->statements[conn_index];
-        if (!mystmt)
-            continue;
-
-        /* Move to the next result set */
-        int err = mysql_stmt_next_result(mystmt);
-        DEBUG("mysql_stmt_next_result(%p) = %d for connection %d", mystmt, err, conn_index);
-
-        if (SB_UNLIKELY(err > 0))
-        {
-            db_error_t rc = check_error(con, "mysql_stmt_next_result()", stmt->query, &rs->counter);
-            if (rc != DB_ERROR_NONE)
-                return rc;
-        }
-
-        if (err == -1)
-        {
-            rs->counter = SB_CNT_OTHER;
-            continue; // No more results for this connection
-        }
-
-        /* Store the result set */
-        err = mysql_stmt_store_result(mystmt);
-        DEBUG("mysql_stmt_store_result(%p) = %d for connection %d", mystmt, err, conn_index);
-
-        if (err)
-        {
-            db_error_t rc = check_error(con, "mysql_stmt_store_result()", NULL, &rs->counter);
-            if (rc != DB_ERROR_NONE)
-                return rc;
-        }
-
-        if (mysql_stmt_errno(mystmt) == 0 && mysql_stmt_field_count(mystmt) == 0)
-        {
-            rs->nrows = (uint32_t)mysql_stmt_affected_rows(mystmt);
-            DEBUG("mysql_stmt_affected_rows(%p) = %u for connection %d", mystmt, (unsigned)rs->nrows, conn_index);
-
-            rs->counter = (rs->nrows > 0) ? SB_CNT_WRITE : SB_CNT_OTHER;
-
-            continue;
-        }
-
-        rs->counter = SB_CNT_READ;
-
-        rs->nrows = (uint32_t)mysql_stmt_num_rows(mystmt);
-        DEBUG("mysql_stmt_num_rows(%p) = %u for connection %d", mystmt, (unsigned)rs->nrows, conn_index);
-
-        rs->nfields = (uint32_t)mysql_stmt_field_count(mystmt);
-        DEBUG("mysql_stmt_field_count(%p) = %u for connection %d", mystmt, (unsigned)rs->nfields);
-
-        /* Store the first connection's result in rs */
-        if (conn_index == 0)
-        {
-            rs->nrows = (uint32_t)mysql_stmt_num_rows(mystmt);
-            rs->nfields = (uint32_t)mysql_stmt_field_count(mystmt);
-            rs->counter = SB_CNT_READ;
-        }
-    }
-
-    return DB_ERROR_NONE;
-}
-
-
-/* Execute SQL query */
+/* 
+* Execute SQL query 
+*/
 db_error_t mysql_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
                            db_result_t *rs)
 {
-  db_mysql_conn_t *db_mysql_con;
+  db_mysql_multi_conn_t *db_mysql_cons;
   MYSQL *con;
-
+  bool select = query && !strncasecmp(query, "SELECT", 6);
   if (args.dry_run)
     return DB_ERROR_NONE;
 
@@ -1120,55 +1172,235 @@ db_error_t mysql_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
   sb_conn->sql_state = NULL;
   sb_conn->sql_errmsg = NULL;
 
-  db_mysql_con = (db_mysql_conn_t *)sb_conn->ptr;
-  con = db_mysql_con->mysql;
+  db_mysql_cons = (db_mysql_multi_conn_t*)sb_conn->ptr;
+  db_mysql_multi_result_t *multi_result = db_mysql_multi_result_create(db_mysql_cons->conn_count);
 
-  int err = mysql_real_query(con, query, len);
-  DEBUG("mysql_real_query(%p, \"%s\", %zd) = %d", con, query, len, err);
+  char *buffers[db_mysql_cons->conn_count];
+  
+  for(int i =0 ; i<db_mysql_cons->conn_count ;++i){
+    con = db_mysql_cons->connections[i].mysql;
+    int err = mysql_real_query(con, query, len);
+    DEBUG("mysql_real_query(%p, \"%s\", %zd) = %d", con, query, len, err);
 
-  if (SB_UNLIKELY(err != 0))
-    return check_error(sb_conn, "mysql_drv_query()", query, &rs->counter);
+    if (SB_UNLIKELY(err != 0))
+      return check_error(sb_conn, "mysql_drv_query()", query, &rs->counter);
 
-  /* Store results and get query type */
-  MYSQL_RES *res = mysql_store_result(con);
-  DEBUG("mysql_store_result(%p) = %p", con, res);
+    /* Store results and get query type */
+    MYSQL_RES *res = mysql_store_result(con);
+    DEBUG("mysql_store_result(%p) = %p", con, res);
 
-  if (res == NULL)
-  {
-    if (mysql_errno(con) == 0 && mysql_field_count(con) == 0)
+    if (res == NULL)
     {
-      /* Not a select. Check if it was a DML */
-      uint32_t nrows = (uint32_t) mysql_affected_rows(con);
-      if (nrows > 0)
+      if (mysql_errno(con) == 0 && mysql_field_count(con) == 0)
       {
-        rs->counter = SB_CNT_WRITE;
-        rs->nrows = nrows;
+        /* Not a select. Check if it was a DML */
+        if(i == 0){
+          uint32_t nrows = (uint32_t) mysql_affected_rows(con);
+          if (nrows > 0)
+          {
+            rs->counter = SB_CNT_WRITE;
+            rs->nrows = nrows;
+          }
+          else
+            rs->counter = SB_CNT_OTHER;
+        }
+        continue;
       }
-      else
-        rs->counter = SB_CNT_OTHER;
+      return check_error(sb_conn, "mysql_store_result()", NULL, &rs->counter);
+    }
+    multi_result->mysql_results[i] = *res;
 
-      return DB_ERROR_NONE;
+    if(select) {
+      MYSQL_ROW row;
+      MYSQL_FIELD *fields = mysql_fetch_fields(res);
+      int num_fields = mysql_num_fields(res);
+      size_t buf_size = 4096;
+      char *buf = malloc(buf_size);
+      if (!buf) {
+          log_text(LOG_FATAL, "Failed to allocate memory for result buffer");
+          return;
+      }
+      int buf_pos = 0;
+      
+      for (int j = 0; j < num_fields; j++) {
+          if (buf_size - buf_pos < (int)fields[j].max_length + 10) {
+              buf_size *= 2;
+              char *new_buf = realloc(buf, buf_size);
+              if (!new_buf) {
+                  log_text(LOG_FATAL, "Failed to reallocate result buffer");
+                  free(buf);
+                  return;
+              }
+              buf = new_buf;
+          }
+          buf_pos += snprintf(buf + buf_pos, buf_size - buf_pos, "| %-*s", 
+                            (int)fields[j].max_length + 2, fields[j].name);
+      }
+      buf_pos += snprintf(buf + buf_pos, buf_size - buf_pos, "|\n");
+      
+      while((row = mysql_fetch_row(res))) {
+          unsigned long *lengths = mysql_fetch_lengths(res);
+          if (!lengths) {
+              log_text(LOG_FATAL, "mysql_fetch_lengths() failed");
+              continue;
+          }
+          
+          for (int j = 0; j < num_fields; j++) {
+              if (buf_size - buf_pos < (int)lengths[j] + 10) {
+                  buf_size *= 2;
+                  char *new_buf = realloc(buf, buf_size);
+                  if (!new_buf) {
+                      log_text(LOG_FATAL, "Failed to reallocate result buffer");
+                      free(buf);
+                      return;
+                  }
+                  buf = new_buf;
+              }
+              buf_pos += snprintf(buf + buf_pos, buf_size - buf_pos, "| %-*.*s ", 
+                                (int)fields[j].max_length + 2, 
+                                (int)lengths[j], 
+                                row[j] ? row[j] : "NULL");
+          }
+          buf_pos += snprintf(buf + buf_pos, buf_size - buf_pos, "|\n");
+      }
+      buf[buf_pos] = '\0';
+      buffers[i] = buf;
     }
 
-    return check_error(sb_conn, "mysql_store_result()", NULL, &rs->counter);
+    if(rs && i == 0){
+      rs->counter = SB_CNT_READ;
+      rs->nrows = mysql_num_rows(res);
+      DEBUG("mysql_num_rows(%p) = %u", res, (unsigned int) rs->nrows);
+      rs->nfields = mysql_num_fields(res);
+      rs->ptr = NULL;
+      DEBUG("mysql_num_fields(%p) = %u", res, (unsigned int) rs->nfields);
+    }
   }
 
-  rs->counter = SB_CNT_READ;
-  rs->ptr = (void *)res;
+  if(select){
+    char* first_res = buffers[0];
+    for(int j = 1; j < db_mysql_cons->conn_count; ++j){
+      if(strcmp(first_res, buffers[j])){
+        fprintf(stdout, "query: %s\n", query);
+        fprintf(stdout, "result0: %s\n", first_res);
+        fprintf(stdout, "result%d: %s\n",j, buffers[j]);
+        
+        FILE *log = fopen("compare.txt", "a");
+        if (log) {
+          time_t now = time(NULL);
+          struct tm *tm_now = localtime(&now);
+          char time_str[64];
+          strftime(time_str, sizeof(time_str), "[%Y-%m-%d %H:%M:%S]", tm_now);
+          
+          fprintf(log, "%s [MISMATCH] query: %s\n", time_str, query);
+          fprintf(log, "result0: %s\n", first_res);
+          fprintf(log, "result%d: %s\n\n", j, buffers[j]);
+          fclose(log);
+        } else {
+          fprintf(stderr, "Failed to open compare.txt for writing\n");
+        }
+      }
+      free(buffers[j]);
+    }
+    free(first_res);
+  }
 
-  rs->nrows = mysql_num_rows(res);
-  DEBUG("mysql_num_rows(%p) = %u", res, (unsigned int) rs->nrows);
-
-  rs->nfields = mysql_num_fields(res);
-  DEBUG("mysql_num_fields(%p) = %u", res, (unsigned int) rs->nfields);
+  //rs->ptr = (void*)multi_result;
 
   return DB_ERROR_NONE;
 }
 
+db_error_t mysql_drv_stmt_next_result(db_stmt_t *stmt, db_result_t *rs)
+{
+    log_text(LOG_FATAL, "not support next_result");
+    return DB_ERROR_NONE;
+    // db_conn_t *con = stmt->connection;
+
+    // if (args.dry_run)
+    //     return DB_ERROR_NONE;
+
+    // con->sql_errno = 0;
+    // con->sql_state = NULL;
+    // con->sql_errmsg = NULL;
+
+    // if (stmt->emulated)
+    //     return mysql_drv_next_result(con, rs);
+
+    // if (!stmt->ptr)
+    // {
+    //     log_text(LOG_DEBUG,
+    //              "ERROR: exiting mysql_drv_stmt_next_result(), "
+    //              "uninitialized statement");
+    //     return DB_ERROR_FATAL;
+    // }
+
+    // mysql_multi_stmt_t *mystmts = (mysql_multi_stmt_t *)stmt->ptr;
+
+    // for (int conn_index = 0; conn_index < mystmts->stmt_count; conn_index++)
+    // {
+    //     MYSQL_STMT *mystmt = mystmts->statements[conn_index];
+    //     if (!mystmt)
+    //         continue;
+
+    //     /* Move to the next result set */
+    //     int err = mysql_stmt_next_result(mystmt);
+    //     DEBUG("mysql_stmt_next_result(%p) = %d for connection %d", mystmt, err, conn_index);
+
+    //     if (SB_UNLIKELY(err > 0))
+    //     {
+    //         db_error_t rc = check_error(con, "mysql_stmt_next_result()", stmt->query, &rs->counter);
+    //         if (rc != DB_ERROR_NONE)
+    //             return rc;
+    //     }
+
+    //     if (err == -1)
+    //     {
+    //         rs->counter = SB_CNT_OTHER;
+    //         continue; // No more results for this connection
+    //     }
+
+    //     /* Store the result set */
+    //     err = mysql_stmt_store_result(mystmt);
+    //     DEBUG("mysql_stmt_store_result(%p) = %d for connection %d", mystmt, err, conn_index);
+
+    //     if (err)
+    //     {
+    //         db_error_t rc = check_error(con, "mysql_stmt_store_result()", NULL, &rs->counter);
+    //         if (rc != DB_ERROR_NONE)
+    //             return rc;
+    //     }
+
+    //     if (mysql_stmt_errno(mystmt) == 0 && mysql_stmt_field_count(mystmt) == 0)
+    //     {
+    //         rs->nrows = (uint32_t)mysql_stmt_affected_rows(mystmt);
+    //         DEBUG("mysql_stmt_affected_rows(%p) = %u for connection %d", mystmt, (unsigned)rs->nrows, conn_index);
+
+    //         rs->counter = (rs->nrows > 0) ? SB_CNT_WRITE : SB_CNT_OTHER;
+
+    //         continue;
+    //     }
+
+    //     rs->counter = SB_CNT_READ;
+
+    //     rs->nrows = (uint32_t)mysql_stmt_num_rows(mystmt);
+    //     DEBUG("mysql_stmt_num_rows(%p) = %u for connection %d", mystmt, (unsigned)rs->nrows, conn_index);
+
+    //     rs->nfields = (uint32_t)mysql_stmt_field_count(mystmt);
+    //     DEBUG("mysql_stmt_field_count(%p) = %u for connection %d", mystmt, (unsigned)rs->nfields,conn_index);
+
+    //     /* Store the first connection's result in rs */
+    //     if (conn_index == 0)
+    //     {
+    //         rs->nrows = (uint32_t)mysql_stmt_num_rows(mystmt);
+    //         rs->nfields = (uint32_t)mysql_stmt_field_count(mystmt);
+    //         rs->counter = SB_CNT_READ;
+    //     }
+    // }
+
+    // return DB_ERROR_NONE;
+}
 
 /* Fetch row from result set of a prepared statement */
-
-
 int mysql_drv_fetch(db_result_t *rs)
 {
   /* NYI */
@@ -1181,118 +1413,122 @@ int mysql_drv_fetch(db_result_t *rs)
 }
 
 /* Fetch row from result set of a query */
-
 int mysql_drv_fetch_row(db_result_t *rs, db_row_t *row)
 {
-  MYSQL_ROW my_row;
-
-  if (args.dry_run)
-    return DB_ERROR_NONE;
-
-  my_row = mysql_fetch_row(rs->ptr);
-  DEBUG("mysql_fetch_row(%p) = %p", rs->ptr, my_row);
-
-  unsigned long *lengths = mysql_fetch_lengths(rs->ptr);
-  DEBUG("mysql_fetch_lengths(%p) = %p", rs->ptr, lengths);
-
-  if (lengths == NULL)
-    return DB_ERROR_IGNORABLE;
-
-  for (size_t i = 0; i < rs->nfields; i++)
-  {
-    row->values[i].len = lengths[i];
-    row->values[i].ptr = my_row[i];
-  }
-
+  log_text(LOG_FATAL, "not support mysql_drv_fetch_row");
   return DB_ERROR_NONE;
+  // MYSQL_ROW my_row;
+
+  // if (args.dry_run)
+  //    return DB_ERROR_NONE;
+
+  // my_row = mysql_fetch_row(rs->ptr);
+  // DEBUG("mysql_fetch_row(%p) = %p", rs->ptr, my_row);
+
+  // unsigned long *lengths = mysql_fetch_lengths(rs->ptr);
+  // DEBUG("mysql_fetch_lengths(%p) = %p", rs->ptr, lengths);
+
+  // if (lengths == NULL)
+  //   return DB_ERROR_IGNORABLE;
+
+  // for (size_t i = 0; i < rs->nfields; i++)
+  // {
+  //   row->values[i].len = lengths[i];
+  //   row->values[i].ptr = my_row[i];
+  // }
+
+  // return DB_ERROR_NONE;
 }
 
 /* Check if more result sets are available */
 
 bool mysql_drv_more_results(db_conn_t *sb_conn)
 {
-  db_mysql_conn_t *db_mysql_con;
-  MYSQL *con;
+  log_text(LOG_FATAL, "not support mysql_drv_next_result");
+  return DB_ERROR_NONE;
+  // db_mysql_conn_t *db_mysql_con;
+  // MYSQL *con;
 
-  if (args.dry_run)
-    return false;
+  // if (args.dry_run)
+  //   return false;
 
-  db_mysql_con = (db_mysql_conn_t *)sb_conn->ptr;
-  con = db_mysql_con->mysql;
+  // db_mysql_con = (db_mysql_conn_t *)sb_conn->ptr;
+  // con = db_mysql_con->mysql;
 
-  bool res = mysql_more_results(con);
-  DEBUG("mysql_more_results(%p) = %d", con, res);
+  // bool res = mysql_more_results(con);
+  // DEBUG("mysql_more_results(%p) = %d", con, res);
 
-  return res;
+  // return res;
 }
 
 /* Retrieve the next result set */
-
 db_error_t mysql_drv_next_result(db_conn_t *sb_conn, db_result_t *rs)
 {
-  db_mysql_conn_t *db_mysql_con;
-  MYSQL *con;
-
-  if (args.dry_run)
-    return DB_ERROR_NONE;
-
-  sb_conn->sql_errno = 0;
-  sb_conn->sql_state = NULL;
-  sb_conn->sql_errmsg = NULL;
-
-  db_mysql_con = (db_mysql_conn_t *)sb_conn->ptr;
-  con = db_mysql_con->mysql;
-
-  int err = mysql_next_result(con);
-  DEBUG("mysql_next_result(%p) = %d", con, err);
-
-  if (SB_UNLIKELY(err > 0))
-    return check_error(sb_conn, "mysql_drv_next_result()", NULL, &rs->counter);
-
-  if (err == -1)
-  {
-    rs->counter = SB_CNT_OTHER;
-    return DB_ERROR_NONE;
-  }
-
-  /* Store results and get query type */
-  MYSQL_RES *res = mysql_store_result(con);
-  DEBUG("mysql_store_result(%p) = %p", con, res);
-
-  if (res == NULL)
-  {
-    if (mysql_errno(con) == 0 && mysql_field_count(con) == 0)
-    {
-      /* Not a select. Check if it was a DML */
-      uint32_t nrows = (uint32_t) mysql_affected_rows(con);
-      if (nrows > 0)
-      {
-        rs->counter = SB_CNT_WRITE;
-        rs->nrows = nrows;
-      }
-      else
-        rs->counter = SB_CNT_OTHER;
-
-      return DB_ERROR_NONE;
-    }
-
-    return check_error(sb_conn, "mysql_store_result()", NULL, &rs->counter);
-  }
-
-  rs->counter = SB_CNT_READ;
-  rs->ptr = (void *)res;
-
-  rs->nrows = mysql_num_rows(res);
-  DEBUG("mysql_num_rows(%p) = %u", res, (unsigned int) rs->nrows);
-
-  rs->nfields = mysql_num_fields(res);
-  DEBUG("mysql_num_fields(%p) = %u", res, (unsigned int) rs->nfields);
-
+  log_text(LOG_FATAL, "not support mysql_drv_next_result");
   return DB_ERROR_NONE;
+
+  // db_mysql_conn_t *db_mysql_con;
+  // MYSQL *con;
+
+  // if (args.dry_run)
+  //   return DB_ERROR_NONE;
+
+  // sb_conn->sql_errno = 0;
+  // sb_conn->sql_state = NULL;
+  // sb_conn->sql_errmsg = NULL;
+
+  // db_mysql_con = (db_mysql_conn_t *)sb_conn->ptr;
+  // con = db_mysql_con->mysql;
+
+  // int err = mysql_next_result(con);
+  // DEBUG("mysql_next_result(%p) = %d", con, err);
+
+  // if (SB_UNLIKELY(err > 0))
+  //   return check_error(sb_conn, "mysql_drv_next_result()", NULL, &rs->counter);
+
+  // if (err == -1)
+  // {
+  //   rs->counter = SB_CNT_OTHER;
+  //   return DB_ERROR_NONE;
+  // }
+
+  // /* Store results and get query type */
+  // MYSQL_RES *res = mysql_store_result(con);
+  // DEBUG("mysql_store_result(%p) = %p", con, res);
+
+  // if (res == NULL)
+  // {
+  //   if (mysql_errno(con) == 0 && mysql_field_count(con) == 0)
+  //   {
+  //     /* Not a select. Check if it was a DML */
+  //     uint32_t nrows = (uint32_t) mysql_affected_rows(con);
+  //     if (nrows > 0)
+  //     {
+  //       rs->counter = SB_CNT_WRITE;
+  //       rs->nrows = nrows;
+  //     }
+  //     else
+  //       rs->counter = SB_CNT_OTHER;
+
+  //     return DB_ERROR_NONE;
+  //   }
+
+  //   return check_error(sb_conn, "mysql_store_result()", NULL, &rs->counter);
+  // }
+
+  // rs->counter = SB_CNT_READ;
+  // rs->ptr = (void *)res;
+
+  // rs->nrows = mysql_num_rows(res);
+  // DEBUG("mysql_num_rows(%p) = %u", res, (unsigned int) rs->nrows);
+
+  // rs->nfields = mysql_num_fields(res);
+  // DEBUG("mysql_num_fields(%p) = %u", res, (unsigned int) rs->nfields);
+
+  // return DB_ERROR_NONE;
 }
 
 /* Free result set */
-
 int mysql_drv_free_results(db_result_t *rs)
 {
   if (args.dry_run)
@@ -1344,6 +1580,7 @@ int mysql_drv_done(void)
   if (args.dry_run)
     return 0;
 
+  pthread_barrier_destroy(&checksum_barrier);
   mysql_library_end();
 
   return 0;
@@ -1420,6 +1657,14 @@ db_mysql_multi_result_t *db_mysql_multi_result_create(int result_count)
         return NULL;
     }
 
+    multi_result->mysql_results = (MYSQL_RES *)calloc(result_count, sizeof(MYSQL_RES));
+    if (!multi_result->mysql_results)
+    {
+        log_text(LOG_FATAL, "Failed to allocate memory for db_result_t array");
+        free(multi_result);
+        return NULL;
+    }
+
     multi_result->result_count = result_count;
 
     return multi_result;
@@ -1429,17 +1674,81 @@ void db_mysql_multi_result_free(db_mysql_multi_result_t *multi_result)
 {
     if (!multi_result)
         return;
-
+    //log_text(LOG_NOTICE, "Freeing multi-result set size: %d", multi_result->result_count);
     for (int i = 0; i < multi_result->result_count; i++)
     {
-        db_result_t *result = &multi_result->results[i];
-        if (result->ptr)
-        {
-            DEBUG("Freeing result for connection %d", i);
-            free(result->ptr);
-        }
+      db_result_t *rs = &multi_result->results[i];
+      mysql_drv_free_results(rs);
     }
 
     free(multi_result->results);
+    free(multi_result->mysql_results);
     free(multi_result);
 }
+
+char* replace_placeholders(const char* q_str, MYSQL_BIND* q_params, int param_count) {
+  if (!q_str || !q_params || param_count < 0) {
+      return NULL;
+  }
+
+  size_t final_len = strlen(q_str) + 1;
+  for (int k = 0; k < param_count; ++k) {
+      switch (q_params[k].buffer_type) {
+          case MYSQL_TYPE_LONG:
+              final_len += 11; 
+              break;
+          case MYSQL_TYPE_LONGLONG:
+              final_len += 20; 
+              break;
+          case MYSQL_TYPE_STRING:
+          case MYSQL_TYPE_VAR_STRING:
+              if (q_params[k].buffer && q_params[k].length) {
+                  final_len += (*q_params[k].length) * 2 + 2; 
+              }
+              break;
+          default:
+              final_len += 32; 
+      }
+  }
+
+  char* final_query = malloc(final_len);
+  if (!final_query) return NULL;
+
+  char* dst = final_query;
+  const char* src = q_str;
+  int param_index = 0;
+  
+  while (*src) {
+      if (*src == '?' && param_index < param_count) {
+          switch (q_params[param_index].buffer_type) {
+              case MYSQL_TYPE_LONG:
+                  dst += sprintf(dst, "%d", *(int*)q_params[param_index].buffer);
+                  break;
+              case MYSQL_TYPE_LONGLONG:
+                  dst += sprintf(dst, "%lld", *(long long*)q_params[param_index].buffer);
+                  break;
+              case MYSQL_TYPE_STRING:
+              case MYSQL_TYPE_VAR_STRING:
+                  *dst++ = '\'';
+                  if (q_params[param_index].buffer && q_params[param_index].length) {
+                      for (size_t i = 0; i < *q_params[param_index].length; i++) {
+                          char c = ((char*)q_params[param_index].buffer)[i];
+                          if (c == '\'' || c == '\\') *dst++ = '\\';
+                          *dst++ = c;
+                      }
+                  }
+                  *dst++ = '\'';
+                  break;
+              default:
+                  *dst++ = '?';
+          }
+          param_index++;
+          src++;
+      } else {
+          *dst++ = *src++;
+      }
+  }
+  *dst = '\0';
+
+  return final_query;
+} 

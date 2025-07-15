@@ -89,7 +89,6 @@ static sb_arg_t db_args[] =
 };
 
 /* Register available database drivers and command line arguments */
-
 int db_register(void)
 {
   sb_list_item_t *pos;
@@ -124,8 +123,6 @@ int db_register(void)
 
 
 /* Print list of available drivers and their options */
-
-
 void db_print_help(void)
 {
   sb_list_item_t *pos;

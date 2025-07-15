@@ -60,6 +60,7 @@
 #define DONE_FUNC "done"
 #define REPORT_INTERMEDIATE_HOOK "report_intermediate"
 #define REPORT_CUMULATIVE_HOOK "report_cumulative"
+#define QGEN_FUNC "qgen"
 
 #define xfree(ptr) ({ if ((ptr) != NULL) free((void *) ptr); ptr = NULL; })
 
@@ -140,6 +141,7 @@ static sb_operations_t lua_ops = {
 static int sb_lua_cmd_prepare(void);
 static int sb_lua_cmd_cleanup(void);
 static int sb_lua_cmd_help(void);
+static int sb_lua_cmd_qgen(void);
 
 /* Initialize interpreter state */
 static lua_State *sb_lua_new_state(void);
@@ -318,6 +320,9 @@ sb_test_t *sb_load_lua(const char *testname)
 
   if (func_available(gstate, HELP_FUNC))
     sbtest.builtin_cmds.help = &sb_lua_cmd_help;
+  
+  if (func_available(gstate, QGEN_FUNC))
+    sbtest.builtin_cmds.qgen = &sb_lua_cmd_qgen;
 
   /* Test operations */
   sbtest.ops = lua_ops;
@@ -804,6 +809,13 @@ int sb_lua_cmd_cleanup(void)
 int sb_lua_cmd_help(void)
 {
   return execute_command(HELP_FUNC);
+}
+
+/* Qgen Command */
+
+int sb_lua_cmd_qgen(void)
+{
+  return execute_command(QGEN_FUNC);
 }
 
 /* Check if a specified hook exists */

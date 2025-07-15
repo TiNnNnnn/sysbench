@@ -209,7 +209,6 @@ static ssl_mode_map_t ssl_mode_names[] = {
 #endif
 
 /* MySQL driver operations */
-
 static int mysql_drv_init(void);
 static int mysql_drv_thread_init(int);
 static int mysql_drv_describe(drv_caps_t *);
@@ -919,7 +918,7 @@ db_error_t mysql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
     rs->nfields = (uint32_t) mysql_stmt_field_count(stmt->ptr);
     DEBUG("mysql_stmt_field_count(%p) = %u", rs->statement->ptr,
           (unsigned) (rs->nfields));
-
+          
     return DB_ERROR_NONE;
   }
 

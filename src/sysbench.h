@@ -139,6 +139,7 @@ typedef struct
   sb_builtin_cmd_func_t *prepare; /* prepare for the test */
   sb_builtin_cmd_func_t *run;   /* run the test */
   sb_builtin_cmd_func_t *cleanup; /* cleanup the test database, files, etc. */
+  sb_builtin_cmd_func_t *qgen;  /* generate query file */
 } sb_builtin_cmds_t;
 
 /* Test operations structure definition */
