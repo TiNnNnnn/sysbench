@@ -668,8 +668,6 @@ SB_GIT_SHA
 AM_LDFLAGS
 AM_CPPFLAGS
 AM_CFLAGS
-USE_CMP_FALSE
-USE_CMP_TRUE
 USE_AIO_FALSE
 USE_AIO_TRUE
 USE_PGSQL
@@ -678,6 +676,9 @@ USE_PGSQL_TRUE
 PGSQL_CFLAGS
 PGSQL_LIBS
 pgconfig
+USE_CMP
+USE_CMP_FALSE
+USE_CMP_TRUE
 USE_MYSQL
 USE_MYSQL_FALSE
 USE_MYSQL_TRUE
@@ -17019,6 +17020,298 @@ fi
 
 
 
+
+if test "x$with_mysql" != xno
+then :
+
+
+# Check for custom MySQL root directory
+if test  "x$with_mysql" != xyes -a "x$with_mysql" != xno
+then
+    ac_cv_mysql_root=`echo "$with_mysql" | sed -e 's+/$++'`
+    if test  -d "$ac_cv_mysql_root/include" -a \
+              -d "$ac_cv_mysql_root/libmysql_r"
+    then
+        ac_cv_mysql_includes="$ac_cv_mysql_root/include"
+        ac_cv_mysql_libs="$ac_cv_mysql_root/libmysql_r"
+    elif test  -x "$ac_cv_mysql_root/bin/mysql_config"
+    then
+        mysqlconfig="$ac_cv_mysql_root/bin/mysql_config"
+    else
+        as_fn_error $? "invalid MySQL root directory: $ac_cv_mysql_root" "$LINENO" 5
+    fi
+fi
+
+# Check for custom includes path
+if test  -z "$ac_cv_mysql_includes"
+then
+
+# Check whether --with-mysql-includes was given.
+if test ${with_mysql_includes+y}
+then :
+  withval=$with_mysql_includes; ac_cv_mysql_includes=$withval
+fi
+
+fi
+if test  -n "$ac_cv_mysql_includes"
+then
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking MySQL includes" >&5
+printf %s "checking MySQL includes... " >&6; }
+if test ${ac_cv_mysql_includes+y}
+then :
+  printf %s "(cached) " >&6
+else $as_nop
+  ac_cv_mysql_includes=""
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_mysql_includes" >&5
+printf "%s\n" "$ac_cv_mysql_includes" >&6; }
+    MYSQL_CFLAGS="-I$ac_cv_mysql_includes"
+fi
+
+# Check for custom library path
+
+if test  -z "$ac_cv_mysql_libs"
+then
+
+# Check whether --with-mysql-libs was given.
+if test ${with_mysql_libs+y}
+then :
+  withval=$with_mysql_libs; ac_cv_mysql_libs=$withval
+fi
+
+fi
+if test  -n "$ac_cv_mysql_libs"
+then
+    # Trim trailing '.libs' if user passed it in --with-mysql-libs option
+    ac_cv_mysql_libs=`echo ${ac_cv_mysql_libs} | sed -e 's/.libs$//' \
+                      -e 's+.libs/$++'`
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking MySQL libraries" >&5
+printf %s "checking MySQL libraries... " >&6; }
+if test ${ac_cv_mysql_libs+y}
+then :
+  printf %s "(cached) " >&6
+else $as_nop
+  ac_cv_mysql_libs=""
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_mysql_libs" >&5
+printf "%s\n" "$ac_cv_mysql_libs" >&6; }
+    save_LDFLAGS="$LDFLAGS"
+    save_LIBS="$LIBS"
+    LDFLAGS="-L$ac_cv_mysql_libs"
+    LIBS=""
+
+    # libmysqlclient_r has been removed in MySQL 5.7
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for library containing mysql_real_connect" >&5
+printf %s "checking for library containing mysql_real_connect... " >&6; }
+if test ${ac_cv_search_mysql_real_connect+y}
+then :
+  printf %s "(cached) " >&6
+else $as_nop
+  ac_func_search_save_LIBS=$LIBS
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+char mysql_real_connect ();
+int
+main (void)
+{
+return mysql_real_connect ();
+  ;
+  return 0;
+}
+_ACEOF
+for ac_lib in '' mysqlclient_r mysqlclient
+do
+  if test -z "$ac_lib"; then
+    ac_res="none required"
+  else
+    ac_res=-l$ac_lib
+    LIBS="-l$ac_lib  $ac_func_search_save_LIBS"
+  fi
+  if ac_fn_c_try_link "$LINENO"
+then :
+  ac_cv_search_mysql_real_connect=$ac_res
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext
+  if test ${ac_cv_search_mysql_real_connect+y}
+then :
+  break
+fi
+done
+if test ${ac_cv_search_mysql_real_connect+y}
+then :
+
+else $as_nop
+  ac_cv_search_mysql_real_connect=no
+fi
+rm conftest.$ac_ext
+LIBS=$ac_func_search_save_LIBS
+fi
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_search_mysql_real_connect" >&5
+printf "%s\n" "$ac_cv_search_mysql_real_connect" >&6; }
+ac_res=$ac_cv_search_mysql_real_connect
+if test "$ac_res" != no
+then :
+  test "$ac_res" = "none required" || LIBS="$ac_res $LIBS"
+
+else $as_nop
+  as_fn_error $? "cannot find MySQL client libraries in $ac_cv_mysql_libs" "$LINENO" 5
+fi
+
+
+    MYSQL_LIBS="$LDFLAGS $LIBS"
+    LIBS="$save_LIBS"
+    LDFLAGS="$save_LDFLAGS"
+fi
+
+# If some path is missing, try to autodetermine with mysql_config
+if test  -z "$ac_cv_mysql_includes" -o -z "$ac_cv_mysql_libs"
+then
+    if test  -z "$mysqlconfig"
+    then
+        # Extract the first word of "mysql_config", so it can be a program name with args.
+set dummy mysql_config; ac_word=$2
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
+printf %s "checking for $ac_word... " >&6; }
+if test ${ac_cv_path_mysqlconfig+y}
+then :
+  printf %s "(cached) " >&6
+else $as_nop
+  case $mysqlconfig in
+  [\\/]* | ?:[\\/]*)
+  ac_cv_path_mysqlconfig="$mysqlconfig" # Let the user override the test with a path.
+  ;;
+  *)
+  as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
+for as_dir in $PATH
+do
+  IFS=$as_save_IFS
+  case $as_dir in #(((
+    '') as_dir=./ ;;
+    */) ;;
+    *) as_dir=$as_dir/ ;;
+  esac
+    for ac_exec_ext in '' $ac_executable_extensions; do
+  if as_fn_executable_p "$as_dir$ac_word$ac_exec_ext"; then
+    ac_cv_path_mysqlconfig="$as_dir$ac_word$ac_exec_ext"
+    printf "%s\n" "$as_me:${as_lineno-$LINENO}: found $as_dir$ac_word$ac_exec_ext" >&5
+    break 2
+  fi
+done
+  done
+IFS=$as_save_IFS
+
+  ;;
+esac
+fi
+mysqlconfig=$ac_cv_path_mysqlconfig
+if test -n "$mysqlconfig"; then
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $mysqlconfig" >&5
+printf "%s\n" "$mysqlconfig" >&6; }
+else
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+fi
+
+
+    fi
+    if test  -z "$mysqlconfig"
+    then
+        as_fn_error $? "mysql_config executable not found
+********************************************************************************
+ERROR: cannot find MySQL libraries. If you want to compile with MySQL support,
+       please install the package containing MySQL client libraries and headers.
+       On Debian-based systems the package name is libmysqlclient-dev.
+       On RedHat-based systems, it is mysql-devel.
+       If you have those libraries installed in non-standard locations,
+       you must either specify file locations explicitly using
+       --with-mysql-includes and --with-mysql-libs options, or make sure path to
+       mysql_config is listed in your PATH environment variable. If you want to
+       disable MySQL support, use --without-mysql option.
+********************************************************************************
+" "$LINENO" 5
+    else
+        if test  -z "$ac_cv_mysql_includes"
+        then
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking MySQL C flags" >&5
+printf %s "checking MySQL C flags... " >&6; }
+            MYSQL_CFLAGS=`${mysqlconfig} --cflags`
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $MYSQL_CFLAGS" >&5
+printf "%s\n" "$MYSQL_CFLAGS" >&6; }
+        fi
+        if test  -z "$ac_cv_mysql_libs"
+        then
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking MySQL linker flags" >&5
+printf %s "checking MySQL linker flags... " >&6; }
+            MYSQL_LIBS=`${mysqlconfig} --libs_r`
+            { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $MYSQL_LIBS" >&5
+printf "%s\n" "$MYSQL_LIBS" >&6; }
+        fi
+    fi
+fi
+
+
+printf "%s\n" "#define USE_CMP 1" >>confdefs.h
+
+
+USE_CMP=1
+
+
+
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if mysql.h defines MYSQL_OPT_SSL_MODE" >&5
+printf %s "checking if mysql.h defines MYSQL_OPT_SSL_MODE... " >&6; }
+
+SAVE_CFLAGS="${CFLAGS}"
+CFLAGS="${CFLAGS} ${MYSQL_CFLAGS}"
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include <mysql.h>
+
+enum mysql_option opt = MYSQL_OPT_SSL_MODE;
+
+int
+main (void)
+{
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+
+
+printf "%s\n" "#define HAVE_MYSQL_OPT_SSL_MODE 1" >>confdefs.h
+
+          { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+else $as_nop
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+
+fi
+CFLAGS="${SAVE_CFLAGS}"
+
+
+ if test "x$with_cmp" != xno; then
+  USE_CMP_TRUE=
+  USE_CMP_FALSE='#'
+else
+  USE_CMP_TRUE='#'
+  USE_CMP_FALSE=
+fi
+
+
+
+
 if test x$with_pgsql != xno
 then :
 
@@ -17288,13 +17581,6 @@ else
 fi
 
 
- if test "x$cmp_support" = "xyes"; then
-  USE_CMP_TRUE=
-  USE_CMP_FALSE='#'
-else
-  USE_CMP_TRUE='#'
-  USE_CMP_FALSE=
-fi
 
 
 ac_fn_c_check_header_compile "$LINENO" "errno.h" "ac_cv_header_errno_h" "$ac_includes_default"
@@ -18478,7 +18764,7 @@ printf "%s\n" "#define SB_GIT_SHA \"$SB_GIT_SHA\"" >>confdefs.h
 
 
 
-ac_config_files="$ac_config_files Makefile third_party/luajit/Makefile third_party/concurrency_kit/Makefile src/Makefile src/drivers/Makefile src/drivers/mysql/Makefile src/drivers/pgsql/Makefile src/drivers/cmp/Makefile src/tests/Makefile src/tests/cpu/Makefile src/tests/fileio/Makefile src/tests/memory/Makefile src/tests/threads/Makefile src/tests/mutex/Makefile src/lua/Makefile src/lua/internal/Makefile tests/Makefile tests/include/config.sh snap/snapcraft.yaml"
+ac_config_files="$ac_config_files Makefile third_party/luajit/Makefile third_party/concurrency_kit/Makefile src/Makefile src/drivers/Makefile src/drivers/mysql/Makefile src/drivers/pgsql/Makefile src/drivers/compare/Makefile src/tests/Makefile src/tests/cpu/Makefile src/tests/fileio/Makefile src/tests/memory/Makefile src/tests/threads/Makefile src/tests/mutex/Makefile src/lua/Makefile src/lua/internal/Makefile tests/Makefile tests/include/config.sh snap/snapcraft.yaml"
 
 cat >confcache <<\_ACEOF
 # This file is a shell script that caches the results of configure
@@ -18633,16 +18919,16 @@ if test -z "${USE_MYSQL_TRUE}" && test -z "${USE_MYSQL_FALSE}"; then
   as_fn_error $? "conditional \"USE_MYSQL\" was never defined.
 Usually this means the macro was only invoked conditionally." "$LINENO" 5
 fi
+if test -z "${USE_CMP_TRUE}" && test -z "${USE_CMP_FALSE}"; then
+  as_fn_error $? "conditional \"USE_CMP\" was never defined.
+Usually this means the macro was only invoked conditionally." "$LINENO" 5
+fi
 if test -z "${USE_PGSQL_TRUE}" && test -z "${USE_PGSQL_FALSE}"; then
   as_fn_error $? "conditional \"USE_PGSQL\" was never defined.
 Usually this means the macro was only invoked conditionally." "$LINENO" 5
 fi
 if test -z "${USE_AIO_TRUE}" && test -z "${USE_AIO_FALSE}"; then
   as_fn_error $? "conditional \"USE_AIO\" was never defined.
-Usually this means the macro was only invoked conditionally." "$LINENO" 5
-fi
-if test -z "${USE_CMP_TRUE}" && test -z "${USE_CMP_FALSE}"; then
-  as_fn_error $? "conditional \"USE_CMP\" was never defined.
 Usually this means the macro was only invoked conditionally." "$LINENO" 5
 fi
 
@@ -19528,7 +19814,7 @@ do
     "src/drivers/Makefile") CONFIG_FILES="$CONFIG_FILES src/drivers/Makefile" ;;
     "src/drivers/mysql/Makefile") CONFIG_FILES="$CONFIG_FILES src/drivers/mysql/Makefile" ;;
     "src/drivers/pgsql/Makefile") CONFIG_FILES="$CONFIG_FILES src/drivers/pgsql/Makefile" ;;
-    "src/drivers/cmp/Makefile") CONFIG_FILES="$CONFIG_FILES src/drivers/cmp/Makefile" ;;
+    "src/drivers/compare/Makefile") CONFIG_FILES="$CONFIG_FILES src/drivers/compare/Makefile" ;;
     "src/tests/Makefile") CONFIG_FILES="$CONFIG_FILES src/tests/Makefile" ;;
     "src/tests/cpu/Makefile") CONFIG_FILES="$CONFIG_FILES src/tests/cpu/Makefile" ;;
     "src/tests/fileio/Makefile") CONFIG_FILES="$CONFIG_FILES src/tests/fileio/Makefile" ;;
