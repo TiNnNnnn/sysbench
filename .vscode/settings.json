@@ -1,6 +1,0 @@
-{
-    "files.associations": {
-        "sb_options.h": "c",
-        "string_view": "c"
-    }
-}
