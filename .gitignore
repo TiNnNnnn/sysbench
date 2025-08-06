@@ -90,3 +90,5 @@ prepare.sh
 qgen.sh
 run.sh
 workload.txt
+/.github/*
+/.vscode/*

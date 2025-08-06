@@ -26,7 +26,7 @@ function prepare_statements()
    -- defaults to 10 in other OLTP scripts
    sysbench.opt.point_selects=1
 
-   prepare_selects()
+   prepare_point_selects()
 end
 
 function event()

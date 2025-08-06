@@ -284,6 +284,9 @@ local stmt_defs = {
    inserts = {
       "INSERT INTO sbtest%u (id, k, c, pad) VALUES (?, ?, ?, ?)",
       t.INT, t.INT, {t.CHAR, 120}, {t.CHAR, 60}},
+   index_join = {
+      "SELECT * FROM sbtest1 AS t1 JOIN sbtest%u AS t2 ON t1.id = t2.k WHERE t1.k > ? LIMIT 10",
+      t.INT},
    selects = {
       {"SELECT t1.c, t2.k FROM sbtest1 as t1 JOIN sbtest%u as t2 ON t1.id = t2.id WHERE t1.id BETWEEN ? AND ? LIMIT 10",
       t.INT, t.INT},
@@ -417,6 +420,10 @@ end
 
 function prepare_point_selects()
    prepare_for_each_table("point_selects")
+end
+
+function prepare_index_joins()
+   prepare_for_each_table("index_join")
 end
 
 function prepare_simple_ranges()
@@ -554,6 +561,16 @@ function execute_selects()
    end
 
    con:query(query)
+end
+
+function execute_index_join()
+   local tnum = get_table_num()
+   local i 
+
+   for i = 1, sysbench.opt.point_selects do
+      param[tnum].index_join[1]:set(get_id())
+      stmt[tnum].index_join:execute()
+   end
 end
 
 function execute_point_selects()
